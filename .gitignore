@@ -1,0 +1,8 @@
+*.o
+*.d
+ff_example
+lib/*
+xdclink.cmd
+xdc_config
+
+
