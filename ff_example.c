@@ -30,26 +30,28 @@
 #include <stdint.h>
 
 #include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
 
-#include "common.h"
+#include "cmem.h"
 
 #undef exit
 
 /* 5 seconds stream duration */
-#define STREAM_DURATION   3.0
-#define STREAM_FRAME_RATE 8 /* 25 images/s */
+#define STREAM_DURATION   2.0
+#define STREAM_FRAME_RATE 5
 #define STREAM_NB_FRAMES  ((int)(STREAM_DURATION * STREAM_FRAME_RATE))
-#define STREAM_PIX_FMT PIX_FMT_YUV420P /* default pix_fmt */
-
 
 
 /**************************************************************/
 /* video output */
-AVFrame *picture, *tmp_picture;
-uint8_t *video_outbuf;
-int frame_count, video_outbuf_size;
-struct buf_info ebuf;
-struct buf_info pbuf;
+static AVFrame *picture, *tmp_picture;
+static uint8_t *video_outbuf;
+static int frame_count, video_outbuf_size;
+static CMEM_AllocParams alloc_params = {
+        .type = CMEM_HEAP,
+        .alignment = 32,
+        .flags = CMEM_NONCACHED,
+};
 
 /* add a video output stream */
 static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
@@ -79,17 +81,8 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
     c->time_base.den = 5000;
     c->time_base.num = 1000;
     c->gop_size = 12; /* emit one intra frame every twelve frames at most */
-    c->pix_fmt = STREAM_PIX_FMT;
-    if (c->codec_id == CODEC_ID_MPEG2VIDEO) {
-        /* just for testing, we also add B frames */
-        c->max_b_frames = 2;
-    }
-    if (c->codec_id == CODEC_ID_MPEG1VIDEO){
-        /* Needed to avoid using macroblocks in which some coeffs overflow.
-           This does not happen with normal video, it just happens here as
-           the motion of the chroma plane does not match the luma plane. */
-        c->mb_decision=2;
-    }
+    c->pix_fmt = PIX_FMT_NV12;
+
     // some formats want stream headers to be separate
     if(oc->oformat->flags & AVFMT_GLOBALHEADER)
         c->flags |= CODEC_FLAG_GLOBAL_HEADER;
@@ -107,8 +100,7 @@ static AVFrame *alloc_picture(enum PixelFormat pix_fmt, int width, int height)
     if (!picture)
         return NULL;
     size = avpicture_get_size(pix_fmt, width, height);
-    allocate_user_buffers(size, &pbuf, 1);
-    picture_buf = pbuf.user_addr;
+    picture_buf = CMEM_alloc(size, &alloc_params);
     if (!picture_buf) {
         av_free(picture);
         return NULL;
@@ -138,17 +130,20 @@ static void open_video(AVFormatContext *oc, AVStream *st)
         exit(1);
     }
 
+    if (codec->pix_fmts && codec->pix_fmts[0] != -1) {
+        c->pix_fmt = codec->pix_fmts[0];
+    }
+
     video_outbuf = NULL;
     if (!(oc->oformat->flags & AVFMT_RAWPICTURE)) {
+
         /* allocate output buffer */
-        /* XXX: API change will be done */
         /* buffers passed into lav* can be allocated any way you prefer,
            as long as they're aligned enough for the architecture, and
            they're freed appropriately (such as using av_free for buffers
            allocated with av_malloc) */
-        video_outbuf_size = 200000;
-        allocate_user_buffers(video_outbuf_size, &ebuf, 1);
-        video_outbuf = ebuf.user_addr;
+        video_outbuf_size = 3*1024*1024;
+        video_outbuf = CMEM_alloc(video_outbuf_size, &alloc_params);
     }
 
     /* allocate the encoded raw picture */
@@ -198,56 +193,54 @@ static int write_video_frame(AVFormatContext *oc, AVStream *st)
 {
     int out_size, ret;
     AVCodecContext *c;
+    static struct SwsContext *sctx = NULL;
 
     c = st->codec;
 
-    if (frame_count >= STREAM_NB_FRAMES) {
-        /* no more frame to compress. The codec has a latency of a few
-           frames if using B frames, so we get the last frames by
-           passing the same picture again */
+    if (c->pix_fmt != PIX_FMT_YUV420P) {
+        if (sctx == NULL) {
+            sctx = sws_getContext(c->width, c->height, PIX_FMT_YUV420P,
+                    c->width, c->height, c->pix_fmt,
+                    SWS_BICUBIC, NULL, NULL, NULL);
+            if (sctx == NULL)
+                return -1;
+        }
+
+        fill_yuv_image(tmp_picture, frame_count, c->width, c->height);
+        sws_scale(sctx, (const uint8_t * const *) tmp_picture->data, tmp_picture->linesize,
+                0, c->height, picture->data, picture->linesize);
     } else {
         fill_yuv_image(picture, frame_count, c->width, c->height);
     }
 
 
-    if (oc->oformat->flags & AVFMT_RAWPICTURE) {
-        /* raw video case. The API will change slightly in the near
-           futur for that */
+    /* encode the image */
+    out_size = avcodec_encode_video(c, video_outbuf, video_outbuf_size, picture);
+    /* if zero size, it means the image was buffered */
+    if (out_size > 0) {
         AVPacket pkt;
         av_init_packet(&pkt);
 
-        pkt.flags |= AV_PKT_FLAG_KEY;
+        if (c->coded_frame->pts != AV_NOPTS_VALUE)
+            pkt.pts= av_rescale_q(c->coded_frame->pts, c->time_base, st->time_base);
+        if(c->coded_frame->key_frame)
+            pkt.flags |= AV_PKT_FLAG_KEY;
         pkt.stream_index= st->index;
-        pkt.data= (uint8_t *)picture;
-        pkt.size= sizeof(AVPicture);
+        pkt.data= video_outbuf;
+        pkt.size= out_size;
 
+        /* write the compressed frame in the media file */
         ret = av_interleaved_write_frame(oc, &pkt);
     } else {
-        /* encode the image */
-        out_size = avcodec_encode_video(c, video_outbuf, video_outbuf_size, picture);
-        /* if zero size, it means the image was buffered */
-        if (out_size > 0) {
-            AVPacket pkt;
-            av_init_packet(&pkt);
-
-            if (c->coded_frame->pts != AV_NOPTS_VALUE)
-                pkt.pts= av_rescale_q(c->coded_frame->pts, c->time_base, st->time_base);
-            if(c->coded_frame->key_frame)
-                pkt.flags |= AV_PKT_FLAG_KEY;
-            pkt.stream_index= st->index;
-            pkt.data= video_outbuf;
-            pkt.size= out_size;
-
-            /* write the compressed frame in the media file */
-            ret = av_interleaved_write_frame(oc, &pkt);
-        } else {
-            ret = 0;
-        }
+        ret = 0;
     }
+
     if (ret != 0) {
         fprintf(stderr, "Error while writing video frame\n");
         return -1;
     }
+
+    printf("Frame written: %d\n", frame_count);
     frame_count++;
 
     return 0;
@@ -256,12 +249,13 @@ static int write_video_frame(AVFormatContext *oc, AVStream *st)
 static void close_video(AVFormatContext *oc, AVStream *st)
 {
     avcodec_close(st->codec);
-    free_user_buffers(&pbuf, 1);
+    CMEM_free(picture->data[0], &alloc_params);
+    av_free(picture);
     if (tmp_picture) {
-        av_free(tmp_picture->data[0]);
+        CMEM_free(tmp_picture->data[0], &alloc_params);
         av_free(tmp_picture);
     }
-    free_user_buffers(&ebuf, 1);
+    CMEM_free(video_outbuf, &alloc_params);
 }
 
 /**************************************************************/
@@ -272,11 +266,9 @@ int ff_example(const char *filename, const char *format)
     AVOutputFormat *fmt;
     AVFormatContext *oc;
     AVStream *video_st;
-    double audio_pts, video_pts;
+    double video_pts;
     int i;
 
-    /* auto detect the output format from the name. default is
-       mpeg. */
     fmt = av_guess_format(format, NULL, NULL);
     if (!fmt) {
         fprintf(stderr, "Could not find suitable output format\n");
@@ -294,19 +286,9 @@ int ff_example(const char *filename, const char *format)
     oc->oformat = fmt;
     snprintf(oc->filename, sizeof(oc->filename), "%s", filename);
 
-    /* add the audio and video streams using the default format codecs
-       and initialize the codecs */
     video_st = NULL;
-    if (fmt->video_codec != CODEC_ID_NONE) {
+    if (fmt->video_codec != CODEC_ID_NONE)
         video_st = add_video_stream(oc, fmt->video_codec);
-    }
-
-    /* set the output parameters (must be done even if no
-       parameters). */
-    if (av_set_parameters(oc, NULL) < 0) {
-        fprintf(stderr, "Invalid output format parameters\n");
-        exit(1);
-    }
 
     av_dump_format(oc, 0, filename, 1);
 
@@ -315,27 +297,21 @@ int ff_example(const char *filename, const char *format)
     if (video_st)
         open_video(oc, video_st);
 
-    /* open the output file, if needed */
-    if (!(fmt->flags & AVFMT_NOFILE)) {
-        if (avio_open(&oc->pb, filename, URL_WRONLY) < 0) {
-            fprintf(stderr, "Could not open '%s'\n", filename);
-            exit(1);
-        }
+    if (avio_open(&oc->pb, filename, URL_WRONLY) < 0) {
+        fprintf(stderr, "Could not open '%s'\n", filename);
+        exit(1);
     }
 
+
     /* write the stream header, if any */
-    av_write_header(oc);
+    avformat_write_header(oc, NULL);
 
     for(;;) {
-        /* compute current audio and video time */
-        audio_pts = 0.0;
 
-        if (video_st)
-            video_pts = (double)video_st->pts.val * video_st->time_base.num / video_st->time_base.den;
-        else
-            video_pts = 0.0;
+        video_pts = (double)video_st->pts.val * video_st->time_base.num / video_st->time_base.den;
+        printf("pts: %f\n", video_pts);
 
-        if ((!video_st || video_pts >= STREAM_DURATION))
+        if (frame_count > STREAM_NB_FRAMES)
             break;
 
         /* write interleaved audio and video frames */
@@ -343,10 +319,8 @@ int ff_example(const char *filename, const char *format)
             break;
     }
 
-    /* write the trailer, if any.  the trailer must be written
-     * before you close the CodecContexts open when you wrote the
-     * header; otherwise write_trailer may try to use memory that
-     * was freed on av_codec_close() */
+    printf("%d frames written\n", frame_count);
+
     av_write_trailer(oc);
 
     /* close each codec */
@@ -359,13 +333,117 @@ int ff_example(const char *filename, const char *format)
         av_freep(&oc->streams[i]);
     }
 
-    if (!(fmt->flags & AVFMT_NOFILE)) {
-        /* close the output file */
-        avio_close(oc->pb);
-    }
+    avio_close(oc->pb);
 
     /* free the stream */
     av_free(oc);
+
+    return 0;
+}
+
+static void pgm_save(unsigned char *buf, int wrap, int xsize, int ysize, char *filename)
+{
+    FILE *f;
+    int i;
+
+    f = fopen(filename, "w");
+    fprintf(f, "P5\n%d %d\n%d\n", xsize, ysize, 255);
+    for (i = 0; i < ysize; i++)
+        fwrite(buf + i * wrap, 1, xsize, f);
+    fclose(f);
+}
+
+static int my_scale(const AVPicture *picture, int width, int height,
+        AVPicture *dst_picture, int factor)
+{
+    int i, j;
+
+    for (j = 0; j < height/factor; j++) {
+        uint8_t *src_lineY = picture->data[0] + j*factor * picture->linesize[0];
+        uint8_t *dst_lineY = dst_picture->data[0] + j * dst_picture->linesize[0];
+
+        for (i = 0; i < width/factor; i++) {
+            *(dst_lineY + i) = *(src_lineY + i*factor);
+        }
+    }
+    for (j = 0; j < height/2/factor; j++) {
+        uint8_t *src_lineUV = picture->data[1] + j*factor * picture->linesize[1];
+        uint8_t *dst_lineUV = dst_picture->data[1] + j * dst_picture->linesize[1];
+
+        for (i = 0; i < width/factor; i+=2) {
+            *(dst_lineUV + i) = *(src_lineUV + i*factor);
+            *(dst_lineUV + i+1) = *(src_lineUV + i*factor + 1);
+        }
+    }
+
+    return 0;
+}
+
+static int save_image(const AVPicture *picture, enum PixelFormat pix_fmt,
+        int width, int height, const char *filename)
+{
+    AVCodec *codec;
+    AVCodecContext *avctx;
+    AVFrame *tmp_picture;
+    uint8_t *outbuf;
+    int outbuf_size;
+    int size;
+    FILE *f;
+
+    avctx = avcodec_alloc_context();
+
+    avctx->codec_id = CODEC_ID_BMP;
+    avctx->codec_type = AVMEDIA_TYPE_VIDEO;
+    avctx->width = width;
+    avctx->height = height;
+    avctx->pix_fmt = PIX_FMT_BGR24;
+    avctx->time_base = (AVRational) {1, 1};
+
+    codec = avcodec_find_encoder(avctx->codec_id);
+    if (!codec) {
+        fprintf(stderr, "codec not found\n");
+        return -1;
+    }
+
+    /* open the codec */
+    if (avcodec_open(avctx, codec) < 0) {
+        fprintf(stderr, "could not open codec\n");
+        return -1;
+    }
+
+    if (pix_fmt != PIX_FMT_BGR24) {
+        struct SwsContext *sctx;
+
+        tmp_picture = alloc_picture(PIX_FMT_BGR24, avctx->width, avctx->height);
+        if (!tmp_picture)
+            return -1;
+
+        sctx = sws_getContext(avctx->width, avctx->height, pix_fmt,
+                avctx->width, avctx->height, PIX_FMT_BGR24,
+                SWS_POINT, NULL, NULL, NULL);
+
+        sws_scale(sctx, (const uint8_t * const *) picture->data, picture->linesize,
+                0, avctx->height, tmp_picture->data, tmp_picture->linesize);
+    } else {
+        tmp_picture = (AVFrame *)picture;
+    }
+
+    outbuf_size = 6*1024*1024;
+    outbuf = av_malloc(outbuf_size);
+    if (!outbuf)
+        return AVERROR(ENOMEM);
+
+    f = fopen(filename, "wb");
+    size = avcodec_encode_video(avctx, outbuf, outbuf_size, tmp_picture);
+    fwrite(outbuf, sizeof(uint8_t), size, f);
+    fclose(f);
+
+    if (pix_fmt != PIX_FMT_BGR24) {
+        CMEM_free(tmp_picture->data[0], &alloc_params);
+    }
+    av_free(tmp_picture);
+    av_free(outbuf);
+    av_free(avctx);
 
     return 0;
 }
@@ -377,16 +455,18 @@ static int decode_example(const char *filename)
     AVCodecContext *avctx;
     int video_st = -1;
     int i, got_pic;
-    AVPacket pkt;
-    AVFrame *picture;
+    AVFrame *picture, *tmp_picture;
+    int size;
+    uint8_t *tmp_buf;
+    int ret = 0;
 
-    av_open_input_file(&fctx, filename, NULL, 0, NULL);
+    avformat_open_input(&fctx, filename, NULL, NULL);
     if (fctx == NULL)
         return AVERROR(1);
 
     av_find_stream_info(fctx);
 
-    dump_format(fctx, 0, filename, 0);
+    av_dump_format(fctx, 0, filename, 0);
 
     for (i = 0; i < fctx->nb_streams; i++) {
         if (fctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -409,30 +489,77 @@ static int decode_example(const char *filename)
     }
 
     picture = avcodec_alloc_frame();
+    tmp_picture = avcodec_alloc_frame();
 
-    while (av_read_frame(fctx, &pkt) >= 0) {
+    size = avpicture_get_size(PIX_FMT_YUV420P, avctx->width, avctx->height);
+    tmp_buf = av_malloc(size);
+    if (tmp_buf == NULL) {
+        ret = AVERROR(ENOMEM);
+        goto decode_cleanup;
+    }
+    avpicture_fill((AVPicture *)tmp_picture, tmp_buf,
+            PIX_FMT_NV12, avctx->width, avctx->height);
+
+    for (i = 0; i < 10; i++) {
+        AVPacket pkt;
         int nb;
+        char fname[32];
+        int factor = 2;
+
+        if (av_read_frame(fctx, &pkt) < 0)
+            break;
+
         nb = avcodec_decode_video2(avctx, picture, &got_pic, &pkt);
         if (nb < 0) {
             av_log(avctx, AV_LOG_ERROR, "error in decoding\n");
             goto decode_cleanup;
         }
+        printf("Decoded frame: %d\n", i);
+
+        my_scale((AVPicture *) picture, avctx->width, avctx->height,
+                (AVPicture *) tmp_picture, factor);
+
+        sprintf(fname, "frame%02d.pgm", i+1);
+        pgm_save(picture->data[0], picture->linesize[0],
+                avctx->width, avctx->height, fname);
+
+        sprintf(fname, "frame%02d.bmp", i+1);
+        save_image((AVPicture *)tmp_picture, avctx->pix_fmt,
+                avctx->width/factor, avctx->height/factor, fname);
     }
 
 decode_cleanup:
-    avcodec_close(avctx);
     av_free(picture);
+    av_free(tmp_picture->data[0]);
+    av_free(tmp_picture);
     av_close_input_file(fctx);
-    return 0;
+    avcodec_close(avctx);
+    return ret;
 }
+
+#ifdef CE_TEST
+#include <xdc/std.h>
+#include <ti/sdo/ce/CERuntime.h>
+#endif
 
 int main()
 {
+    CMEM_init();
+
+#ifdef CE_TEST
+    CERuntime_init();
+    CERuntime_exit();
+    CERuntime_init();
+    CERuntime_exit();
+#endif
+
     /* initialize libavcodec, and register all codecs and formats */
     av_register_all();
 
-    ff_example("test.mkv", "matroska");
+    /* TODO: can't run both yet, some problem with CE init and exit */
+//    ff_example("test.mkv", "matroska");
     decode_example("test.mkv");
 
+    CMEM_exit();
     return 0;
 }
