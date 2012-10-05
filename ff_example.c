@@ -32,6 +32,9 @@
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 
+#include <xdc/std.h>
+#include <ti/sdo/ce/CERuntime.h>
+
 #include "cmem.h"
 
 #undef exit
@@ -82,6 +85,7 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
     c->time_base.num = 1000;
     c->gop_size = 12; /* emit one intra frame every twelve frames at most */
     c->pix_fmt = PIX_FMT_NV12;
+    c->mpeg_quant = 20;
 
     // some formats want stream headers to be separate
     if(oc->oformat->flags & AVFMT_GLOBALHEADER)
@@ -219,6 +223,8 @@ static int write_video_frame(AVFormatContext *oc, AVStream *st)
     /* if zero size, it means the image was buffered */
     if (out_size > 0) {
         AVPacket pkt;
+        FILE *ff = fopen("xx.jpeg", "w+");
+
         av_init_packet(&pkt);
 
         if (c->coded_frame->pts != AV_NOPTS_VALUE)
@@ -231,6 +237,9 @@ static int write_video_frame(AVFormatContext *oc, AVStream *st)
 
         /* write the compressed frame in the media file */
         ret = av_interleaved_write_frame(oc, &pkt);
+
+        fwrite(video_outbuf, out_size, 1, ff);
+        fclose(ff);
     } else {
         ret = 0;
     }
@@ -275,7 +284,7 @@ int ff_example(const char *filename, const char *format)
         exit(1);
     }
 
-    fmt->video_codec = CODEC_ID_H264;
+    fmt->video_codec = CODEC_ID_MJPEG;
 
     /* allocate the output media context */
     oc = avformat_alloc_context();
@@ -544,6 +553,7 @@ decode_cleanup:
 
 int main()
 {
+    CERuntime_init();
     CMEM_init();
 
 #ifdef CE_TEST
@@ -557,9 +567,10 @@ int main()
     av_register_all();
 
     /* TODO: can't run both yet, some problem with CE init and exit */
-//    ff_example("test.mkv", "matroska");
-    decode_example("test.mkv");
+    ff_example("test.avi", "avi");
+//    decode_example("test.mkv");
 
     CMEM_exit();
+    CERuntime_exit();
     return 0;
 }
